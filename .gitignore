@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+passive_osint.db
+reports/
