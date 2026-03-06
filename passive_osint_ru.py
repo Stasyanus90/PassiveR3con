@@ -15,9 +15,16 @@ import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 TARGET_RE = re.compile(r"^(?=.{1,253}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}$")
+WHOIS_FIELD_PATTERNS = {
+    "registrar": re.compile(r"(?im)^\s*registrar\s*:\s*(.+)$"),
+    "org": re.compile(r"(?im)^\s*(?:org|organization|registrant organization)\s*:\s*(.+)$"),
+    "country": re.compile(r"(?im)^\s*country\s*:\s*(.+)$"),
+    "created": re.compile(r"(?im)^\s*(?:creation date|created on|created)\s*:\s*(.+)$"),
+    "expires": re.compile(r"(?im)^\s*(?:registry expiry date|expiry date|paid-till|expires)\s*:\s*(.+)$"),
+}
 
 
 def now_iso() -> str:
@@ -73,7 +80,7 @@ def complete_scan(conn: sqlite3.Connection, scan_id: int, status: str, report_pa
     conn.commit()
 
 
-def save_finding(conn: sqlite3.Connection, scan_id: int, category: str, source: str, data: Dict) -> None:
+def save_finding(conn: sqlite3.Connection, scan_id: int, category: str, source: str, data: Dict[str, Any]) -> None:
     conn.execute(
         "INSERT INTO findings(scan_id, category, source, data_json, created_at) VALUES (?, ?, ?, ?, ?)",
         (scan_id, category, source, json.dumps(data, ensure_ascii=False), now_iso()),
@@ -81,7 +88,7 @@ def save_finding(conn: sqlite3.Connection, scan_id: int, category: str, source: 
     conn.commit()
 
 
-def run_command(command: List[str], timeout: int = 25) -> Dict:
+def run_command(command: List[str], timeout: int = 25) -> Dict[str, Any]:
     binary = command[0]
     if not shutil.which(binary):
         return {
@@ -111,7 +118,7 @@ def run_command(command: List[str], timeout: int = 25) -> Dict:
         }
 
 
-def resolve_ips(target: str) -> Dict:
+def resolve_ips(target: str) -> Dict[str, Any]:
     try:
         records = socket.getaddrinfo(target, None)
         ips = sorted({item[4][0] for item in records})
@@ -120,7 +127,7 @@ def resolve_ips(target: str) -> Dict:
         return {"target": target, "ips": [], "count": 0, "error": str(err)}
 
 
-def crtsh_query(target: str) -> Dict:
+def crtsh_query(target: str) -> Dict[str, Any]:
     query = urllib.parse.quote(f"%.{target}")
     url = f"https://crt.sh/?q={query}&output=json"
     req = urllib.request.Request(url, headers={"User-Agent": "PassiveR3con/1.0"})
@@ -160,7 +167,7 @@ def load_targets(single_target: str | None, file_path: Path | None) -> Tuple[Lis
     if not file_path.exists():
         raise ValueError(f"Файл не найден: {file_path}")
 
-    valid = []
+    valid: List[str] = []
     for line in file_path.read_text(encoding="utf-8").splitlines():
         candidate = line.strip().lower()
         if candidate and not candidate.startswith("#") and TARGET_RE.match(candidate):
@@ -181,73 +188,336 @@ def parse_targets_text(raw: str) -> List[str]:
     return sorted(set(out))
 
 
-def render_html(scan_id: int, target: str, started: str, finished: str, findings: List[Tuple[str, str, Dict]]) -> str:
-    cards = []
-    for category, source, data in findings:
-        pretty = html.escape(json.dumps(data, ensure_ascii=False, indent=2))
-        cards.append(f'<section class="card"><div class="meta">{html.escape(category)} · {html.escape(source)}</div><pre>{pretty}</pre></section>')
-    cards_html = "\n".join(cards) if cards else "<p>Нет данных для отображения.</p>"
-    return f"""<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/><title>Отчёт Passive OSINT — {html.escape(target)}</title><style>
-:root{{--bg:#070b1a;--p:#111936;--c:#16254c;--txt:#e8ebf4;--m:#94a3b8;--a:#38bdf8;--a2:#22d3ee;}}
-body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--txt);background:radial-gradient(circle at 20% 0%,#172554 0%,#070b1a 45%),var(--bg)}}
-.container{{max-width:1120px;margin:0 auto;padding:26px}}.hero{{padding:24px;border-radius:18px;background:linear-gradient(135deg,rgba(56,189,248,.20),rgba(34,211,238,.10));border:1px solid rgba(148,163,184,.25);box-shadow:0 10px 35px rgba(0,0,0,.3)}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-top:22px}}.card{{background:rgba(22,37,76,.85);border:1px solid rgba(148,163,184,.15);border-radius:14px;padding:12px}}.meta{{color:var(--a2);font-weight:700;margin-bottom:8px}}pre{{margin:0;white-space:pre-wrap;word-break:break-word}}.muted{{color:var(--m)}}
-</style></head><body><div class=\"container\"><section class=\"hero\"><h1>Отчёт пассивной разведки</h1><p><b>Цель:</b> {html.escape(target)}</p><p class=\"muted\">ID: {scan_id} · Начало: {html.escape(started)} · Окончание: {html.escape(finished)}</p></section><div class=\"grid\">{cards_html}</div></div></body></html>"""
+def parse_whois_fields(whois_text: str) -> Dict[str, str]:
+    info: Dict[str, str] = {}
+    for key, pattern in WHOIS_FIELD_PATTERNS.items():
+        match = pattern.search(whois_text)
+        if match:
+            info[key] = match.group(1).strip()
+    return info
+
+
+def extract_dns_records(lines: str) -> List[str]:
+    out = []
+    for line in lines.splitlines():
+        value = line.strip()
+        if value and not value.startswith(";"):
+            out.append(value)
+    return out
+
+
+def analyze_findings(target: str, findings_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    whois_data = findings_map.get("whois", {})
+    dig_data = findings_map.get("dig", {})
+    nslookup_data = findings_map.get("nslookup", {})
+    host_data = findings_map.get("host", {})
+    socket_data = findings_map.get("socket.getaddrinfo", {})
+    crt_data = findings_map.get("crt.sh", {})
+
+    whois_text = whois_data.get("stdout", "")
+    whois_info = parse_whois_fields(whois_text) if whois_text else {}
+    dns_from_dig = extract_dns_records(dig_data.get("stdout", ""))
+    dns_from_host = extract_dns_records(host_data.get("stdout", ""))
+    ips = socket_data.get("ips", []) if isinstance(socket_data.get("ips", []), list) else []
+    subdomains = crt_data.get("entries", []) if isinstance(crt_data.get("entries", []), list) else []
+
+    unavailable_tools = []
+    for tool in ["whois", "dig", "nslookup", "host"]:
+        data = findings_map.get(tool, {})
+        if not data.get("available", False):
+            unavailable_tools.append(tool)
+
+    risk_score = 0
+    if len(subdomains) > 20:
+        risk_score += 2
+    elif len(subdomains) > 5:
+        risk_score += 1
+
+    if len(ips) > 3:
+        risk_score += 1
+
+    if unavailable_tools:
+        risk_score += 1
+
+    level = "Низкий"
+    if risk_score >= 4:
+        level = "Высокий"
+    elif risk_score >= 2:
+        level = "Средний"
+
+    conclusions = [
+        f"Для цели {target} найдено {len(ips)} уникальных IP-адресов.",
+        f"В CT-логах обнаружено {len(subdomains)} связанных доменных имён.",
+    ]
+
+    if whois_info.get("registrar"):
+        conclusions.append(f"Регистратор домена: {whois_info['registrar']}.")
+
+    if unavailable_tools:
+        conclusions.append(
+            f"Часть инструментов отсутствует в системе: {', '.join(unavailable_tools)}. Полнота разведки снижена."
+        )
+
+    recommendations = [
+        "Проверить найденные поддомены на актуальность и принадлежность организации.",
+        "Сопоставить IP-адреса с ASN/провайдерами и исключить стороннюю инфраструктуру.",
+    ]
+    if len(subdomains) > 20:
+        recommendations.append("Приоритизировать поддомены с dev/stage/admin в названии для ручного анализа.")
+    if unavailable_tools:
+        recommendations.append("Установить отсутствующие инструменты для повышения точности пассивной разведки.")
+
+    return {
+        "risk_level": level,
+        "risk_score": risk_score,
+        "metrics": {
+            "ip_count": len(ips),
+            "ct_subdomains_count": len(subdomains),
+            "dns_records_dig": len(dns_from_dig),
+            "dns_records_host": len(dns_from_host),
+        },
+        "whois_summary": whois_info,
+        "dns_summary": {
+            "dig_records": dns_from_dig[:20],
+            "host_records": dns_from_host[:20],
+            "nslookup_excerpt": nslookup_data.get("stdout", "")[:1200],
+            "ip_addresses": ips,
+        },
+        "ct_summary": {
+            "sample": subdomains[:30],
+            "total": len(subdomains),
+        },
+        "tooling": {
+            "missing": unavailable_tools,
+            "errors": {
+                source: data.get("stderr", "")
+                for source, data in findings_map.items()
+                if isinstance(data, dict) and data.get("stderr")
+            },
+        },
+        "conclusions": conclusions,
+        "recommendations": recommendations,
+    }
+
+
+def render_html(scan_id: int, target: str, started: str, finished: str, analysis: Dict[str, Any]) -> str:
+    metrics = analysis["metrics"]
+    whois_summary = analysis["whois_summary"]
+    dns_summary = analysis["dns_summary"]
+    ct_summary = analysis["ct_summary"]
+    tooling = analysis["tooling"]
+
+    def esc(value: Any) -> str:
+        return html.escape(str(value))
+
+    whois_rows = "".join(
+        f"<li><span>{esc(k)}</span><b>{esc(v)}</b></li>" for k, v in whois_summary.items()
+    ) or "<li><span>whois</span><b>Данные не извлечены</b></li>"
+
+    conclusions = "".join(f"<li>{esc(item)}</li>" for item in analysis["conclusions"])
+    recommendations = "".join(f"<li>{esc(item)}</li>" for item in analysis["recommendations"])
+    ct_sample = "".join(f"<li>{esc(item)}</li>" for item in ct_summary["sample"][:15]) or "<li>Не найдено</li>"
+    missing = ", ".join(tooling["missing"]) if tooling["missing"] else "нет"
+
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RedTeam Passive Report — {esc(target)}</title>
+  <style>
+    :root {{
+      --bg: #070707;
+      --panel: #111111;
+      --line: #252525;
+      --text: #e6e6e6;
+      --muted: #a2a2a2;
+      --red: #ff2e2e;
+      --red-soft: #ff2e2e20;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; background: var(--bg); color: var(--text); font-family: Inter, Segoe UI, sans-serif; }}
+    .wrap {{ max-width: 1120px; margin: 0 auto; padding: 24px; }}
+    .top {{ border: 1px solid var(--line); background: var(--panel); padding: 20px; border-radius: 10px; }}
+    h1, h2 {{ margin: 0 0 12px; font-weight: 650; letter-spacing: .4px; }}
+    .label {{ color: var(--muted); font-size: 13px; }}
+    .risk {{ display: inline-block; margin-top: 8px; padding: 6px 10px; border: 1px solid var(--red); color: var(--red); background: var(--red-soft); border-radius: 8px; font-size: 13px; }}
+    .grid {{ margin-top: 14px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }}
+    .metric {{ border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: #0f0f0f; }}
+    .metric b {{ display: block; font-size: 24px; margin-top: 4px; color: #fff; }}
+    .layout {{ margin-top: 14px; display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }}
+    .card {{ border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 14px; }}
+    ul {{ margin: 0; padding-left: 18px; }}
+    li {{ margin-bottom: 6px; }}
+    .kv li {{ list-style: none; padding: 6px 0; display: flex; justify-content: space-between; border-bottom: 1px dashed #2f2f2f; }}
+    .kv span {{ color: var(--muted); text-transform: capitalize; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; color: #cfcfcf; font-size: 12px; }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns: repeat(2, 1fr); }} .layout {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="top">
+      <h1>PassiveR3con / RedTeam Report</h1>
+      <div class="label">Цель: {esc(target)} · Scan ID: {scan_id} · Начало: {esc(started)} · Окончание: {esc(finished)}</div>
+      <span class="risk">Риск: {esc(analysis['risk_level'])} (score {esc(analysis['risk_score'])})</span>
+      <div class="grid">
+        <div class="metric"><span class="label">IP-адреса</span><b>{esc(metrics['ip_count'])}</b></div>
+        <div class="metric"><span class="label">CT-поддомены</span><b>{esc(metrics['ct_subdomains_count'])}</b></div>
+        <div class="metric"><span class="label">Записи dig</span><b>{esc(metrics['dns_records_dig'])}</b></div>
+        <div class="metric"><span class="label">Записи host</span><b>{esc(metrics['dns_records_host'])}</b></div>
+      </div>
+    </section>
+
+    <section class="layout">
+      <article class="card">
+        <h2>Выводы</h2>
+        <ul>{conclusions}</ul>
+      </article>
+      <article class="card">
+        <h2>Рекомендации</h2>
+        <ul>{recommendations}</ul>
+      </article>
+      <article class="card">
+        <h2>Кратко по WHOIS</h2>
+        <ul class="kv">{whois_rows}</ul>
+      </article>
+      <article class="card">
+        <h2>CT-лог (примеры)</h2>
+        <ul>{ct_sample}</ul>
+      </article>
+      <article class="card">
+        <h2>DNS-данные</h2>
+        <p class="label">IP: {esc(', '.join(dns_summary['ip_addresses']) if dns_summary['ip_addresses'] else 'нет')}</p>
+        <p class="label">Инструменты отсутствуют: {esc(missing)}</p>
+        <div class="mono">{esc(dns_summary['nslookup_excerpt'] or 'nslookup не вернул содержимого')}</div>
+      </article>
+      <article class="card">
+        <h2>Служебные ошибки</h2>
+        <div class="mono">{esc(json.dumps(tooling['errors'], ensure_ascii=False, indent=2) if tooling['errors'] else 'Ошибок не зафиксировано')}</div>
+      </article>
+    </section>
+  </main>
+</body>
+</html>
+"""
 
 
 def collect_for_target(conn: sqlite3.Connection, target: str, input_type: str, report_dir: Path) -> Path:
     scan_id = create_scan(conn, target, input_type)
     started = now_iso()
-    collection: List[Tuple[str, str, Dict]] = []
+    collected: Dict[str, Dict[str, Any]] = {}
 
-    commands = [
+    command_sets = [
         ("whois", ["whois", target]),
-        ("dns", ["dig", "+short", target]),
-        ("dns", ["nslookup", target]),
-        ("dns", ["host", target]),
+        ("dig", ["dig", "+short", target]),
+        ("nslookup", ["nslookup", target]),
+        ("host", ["host", target]),
     ]
-    for category, cmd in commands:
-        result = run_command(cmd)
-        save_finding(conn, scan_id, category, cmd[0], result)
-        collection.append((category, cmd[0], result))
 
-    dns_result = resolve_ips(target)
-    cert_result = crtsh_query(target)
-    for category, source, data in [
-        ("dns", "socket.getaddrinfo", dns_result),
-        ("certificates", "crt.sh", cert_result),
-    ]:
-        save_finding(conn, scan_id, category, source, data)
-        collection.append((category, source, data))
+    for source, command in command_sets:
+        result = run_command(command)
+        collected[source] = result
+        save_finding(conn, scan_id, "tool", source, result)
+
+    socket_result = resolve_ips(target)
+    crtsh_result = crtsh_query(target)
+    collected["socket.getaddrinfo"] = socket_result
+    collected["crt.sh"] = crtsh_result
+    save_finding(conn, scan_id, "dns", "socket.getaddrinfo", socket_result)
+    save_finding(conn, scan_id, "certificates", "crt.sh", crtsh_result)
+
+    analysis = analyze_findings(target, collected)
+    save_finding(conn, scan_id, "analysis", "summary", analysis)
 
     finished = now_iso()
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"report_{target.replace('.', '_')}_{scan_id}.html"
-    report_path.write_text(render_html(scan_id, target, started, finished, collection), encoding="utf-8")
+    report_path.write_text(render_html(scan_id, target, started, finished, analysis), encoding="utf-8")
+
     complete_scan(conn, scan_id, "finished", report_path)
     return report_path
 
 
 def web_dashboard_html() -> str:
-    return """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>PassiveR3con UI</title><style>
-:root{--bg:#0a1022;--card:#111b3b;--card2:#182851;--text:#eef2ff;--muted:#94a3b8;--accent:#38bdf8;--ok:#22c55e;}
-*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:radial-gradient(circle at 10% 0%,#1d4ed8 0,#0a1022 48%),var(--bg);color:var(--text)}
-.container{max-width:1100px;margin:0 auto;padding:26px}.hero{background:linear-gradient(130deg,rgba(56,189,248,.22),rgba(34,211,238,.11));border:1px solid rgba(148,163,184,.2);border-radius:20px;padding:22px;box-shadow:0 18px 50px rgba(0,0,0,.35)}
-.grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px;margin-top:18px}@media(max-width:920px){.grid{grid-template-columns:1fr}}
-.card{background:rgba(17,27,59,.88);border:1px solid rgba(148,163,184,.18);border-radius:16px;padding:16px}.input,textarea{width:100%;padding:12px;border-radius:12px;border:1px solid #243b70;background:#0f1835;color:#e2e8f0;outline:none}
-textarea{min-height:130px;resize:vertical}.btn{cursor:pointer;padding:12px 16px;border:none;border-radius:12px;background:linear-gradient(90deg,#38bdf8,#22d3ee);color:#03111f;font-weight:700;margin-top:10px}.hint{color:var(--muted);font-size:13px}
-ul{padding-left:20px}a{color:var(--accent)}
-</style></head><body><div class='container'><section class='hero'><h1>PassiveR3con — современный UI</h1><p>Русскоязычная пассивная OSINT-разведка с сохранением в БД и HTML-отчётами.</p></section>
-<div class='grid'><section class='card'><h2>Новый запуск</h2><form method='post' action='/scan'><label>Один домен/поддомен</label><input class='input' name='target' placeholder='example.com'>
-<p class='hint'>Или укажите список ниже (по одному значению на строку).</p><label>Список целей</label><textarea name='targets_text' placeholder='example.com\nsub.example.com'></textarea><button class='btn' type='submit'>Запустить пассивную разведку</button></form></section>
-<section class='card'><h2>Что делает программа</h2><ul><li>Реально запускает whois/dig/nslookup/host</li><li>Собирает DNS и CT-данные</li><li>Сохраняет результаты в SQLite</li><li>Формирует красивый HTML-отчёт на русском</li></ul></section></div></div></body></html>"""
+    return """<!doctype html>
+<html lang='ru'>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width,initial-scale=1'>
+  <title>PassiveR3con UI</title>
+  <style>
+    :root{--bg:#080808;--panel:#111;--line:#252525;--text:#ebebeb;--muted:#9a9a9a;--red:#ff3434;}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Segoe UI,sans-serif}
+    .wrap{max-width:980px;margin:0 auto;padding:28px}
+    .head,.card{border:1px solid var(--line);background:var(--panel);border-radius:10px}
+    .head{padding:18px;margin-bottom:12px}
+    .card{padding:16px}
+    h1{margin:0 0 8px;font-size:28px;letter-spacing:.3px}
+    .muted{color:var(--muted);font-size:13px}
+    .badge{display:inline-block;border:1px solid var(--red);color:var(--red);padding:4px 8px;border-radius:6px;font-size:12px;margin-top:8px}
+    label{display:block;font-size:13px;margin:10px 0 6px;color:#cfcfcf}
+    input,textarea{width:100%;background:#0c0c0c;border:1px solid #2a2a2a;color:#fff;border-radius:8px;padding:11px}
+    textarea{min-height:130px;resize:vertical}
+    button{margin-top:12px;border:1px solid var(--red);background:#170b0b;color:#ff6b6b;padding:10px 14px;border-radius:8px;cursor:pointer}
+    ul{margin:0;padding-left:18px}
+  </style>
+</head>
+<body>
+  <main class='wrap'>
+    <section class='head'>
+      <h1>PassiveR3con</h1>
+      <div class='muted'>Минималистичный RedTeam-интерфейс для пассивной разведки.</div>
+      <span class='badge'>PASSIVE / OPSEC-SAFE</span>
+    </section>
+
+    <section class='card'>
+      <form method='post' action='/scan'>
+        <label>Один домен/поддомен</label>
+        <input name='target' placeholder='example.com'>
+
+        <label>Или список целей (по одной на строку)</label>
+        <textarea name='targets_text' placeholder='example.com\nmail.example.com'></textarea>
+
+        <button type='submit'>Запустить разведку</button>
+      </form>
+      <p class='muted'>Инструменты: whois, dig, nslookup, host, socket.getaddrinfo, crt.sh</p>
+    </section>
+  </main>
+</body>
+</html>
+"""
 
 
 def render_scan_result(reports: List[Path], errors: List[str]) -> str:
-    report_items = "".join(f"<li><a href='/{html.escape(str(path))}' target='_blank'>{html.escape(str(path))}</a></li>" for path in reports)
-    err_items = "".join(f"<li>{html.escape(err)}</li>" for err in errors)
-    return f"""<!doctype html><html lang='ru'><head><meta charset='utf-8'><title>Результат</title><style>body{{font-family:Inter,Segoe UI,Arial,sans-serif;background:#0b1020;color:#e5e7eb;padding:30px}}a{{color:#38bdf8}}.card{{max-width:900px;background:#121a31;border:1px solid #334155;border-radius:16px;padding:20px}}</style></head><body><div class='card'><h1>Сканирование завершено</h1><h3>Отчёты</h3><ul>{report_items or '<li>Отчёты не созданы.</li>'}</ul><h3>Ошибки</h3><ul>{err_items or '<li>Ошибок нет.</li>'}</ul><p><a href='/'>← Вернуться на главную</a></p></div></body></html>"""
+    report_items = "".join(
+        f"<li><a href='/{html.escape(str(path))}' target='_blank'>{html.escape(str(path))}</a></li>" for path in reports
+    )
+    error_items = "".join(f"<li>{html.escape(error)}</li>" for error in errors)
+    return f"""<!doctype html>
+<html lang='ru'>
+<head>
+  <meta charset='utf-8'>
+  <title>Результаты сканирования</title>
+  <style>
+    body{{font-family:Inter,Segoe UI,sans-serif;background:#080808;color:#efefef;padding:24px}}
+    .box{{max-width:900px;border:1px solid #2c2c2c;background:#111;padding:16px;border-radius:10px}}
+    a{{color:#ff5c5c}}
+  </style>
+</head>
+<body>
+  <section class='box'>
+    <h1>Сканирование завершено</h1>
+    <h3>Отчёты</h3>
+    <ul>{report_items or '<li>Отчёты не созданы.</li>'}</ul>
+    <h3>Ошибки</h3>
+    <ul>{error_items or '<li>Ошибок нет.</li>'}</ul>
+    <p><a href='/'>← Назад</a></p>
+  </section>
+</body>
+</html>
+"""
 
 
 class PassiveUIHandler(BaseHTTPRequestHandler):
@@ -283,7 +553,7 @@ class PassiveUIHandler(BaseHTTPRequestHandler):
         target = data.get("target", [""])[0].strip().lower()
         targets_text = data.get("targets_text", [""])[0]
 
-        targets = []
+        targets: List[str] = []
         if target:
             targets = [target] if TARGET_RE.match(target) else []
         elif targets_text.strip():
@@ -298,13 +568,14 @@ class PassiveUIHandler(BaseHTTPRequestHandler):
         for item in targets:
             try:
                 with self.lock:
-                    reports.append(collect_for_target(self.conn, item, "ui", self.report_dir))
+                    report = collect_for_target(self.conn, item, "ui", self.report_dir)
+                reports.append(report)
             except Exception as exc:
                 errors.append(f"{item}: {exc}")
 
         self.respond_html(render_scan_result(reports, errors))
 
-    def log_message(self, format: str, *args) -> None:
+    def log_message(self, _format: str, *args: Any) -> None:
         return
 
     def respond_html(self, body: str) -> None:
@@ -333,12 +604,14 @@ def run_ui(host: str, port: int, conn: sqlite3.Connection, report_dir: Path) -> 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Платформа пассивной разведки (OSINT) с БД, отчётами и web UI.")
+    parser = argparse.ArgumentParser(
+        description="Платформа пассивной разведки (OSINT) с БД, аналитическим отчётом и web UI."
+    )
     parser.add_argument("--target", help="Один домен или поддомен для анализа.")
     parser.add_argument("--file", type=Path, help="Файл со списком доменов/поддоменов (по одному на строку).")
     parser.add_argument("--db", type=Path, default=Path("passive_osint.db"), help="Путь к SQLite БД.")
     parser.add_argument("--report-dir", type=Path, default=Path("reports"), help="Каталог для HTML отчётов.")
-    parser.add_argument("--ui", action="store_true", help="Запустить красивый web UI.")
+    parser.add_argument("--ui", action="store_true", help="Запустить минималистичный web UI в RedTeam-стиле.")
     parser.add_argument("--host", default="127.0.0.1", help="Хост для web UI.")
     parser.add_argument("--port", type=int, default=8080, help="Порт для web UI.")
     return parser.parse_args()
